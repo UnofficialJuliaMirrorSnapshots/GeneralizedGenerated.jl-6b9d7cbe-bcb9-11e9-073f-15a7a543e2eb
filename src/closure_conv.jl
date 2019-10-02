@@ -72,7 +72,7 @@ function top_level_closure_conv(def_module::Module, ex)
         # mutable free variables stored in Core.Box
         stmts = Expr[]
         for bound in bounds
-            if bound.is_mutable.x
+            if bound.is_mutable[] && bound.is_shared[]
                 sym = bound.sym
                 if sym in argnames
                     push!(stmts, :($sym = $Core.Box($sym)))
@@ -99,10 +99,10 @@ function top_level_closure_conv(def_module::Module, ex)
             fn = RuntimeFn{Args, Kwargs, to_type(body)}()
             if !isempty(freesyms)
                 tp = Expr(:tuple, freesyms...)
-                fn = :(let _free = $tp; $Closure{$fn, $typeof($tp)}(_free) end)
+                fn = :(let _free = $tp; $Closure{$fn, $typeof(_free)}(_free) end)
             end
-            if check_fun_mut.x isa LocalVar
-                sym = check_fun_mut.x |> closure_conv
+            if check_fun_mut[] !== nothing
+                sym = check_fun_mut[] |> closure_conv
                 fn = :($sym = $fn)
             end
             fn
@@ -118,7 +118,7 @@ function top_level_closure_conv(def_module::Module, ex)
     function closure_conv(ex::ScopedVar)
         var = ex.scope[ex.sym]
         var isa GlobalVar && return :($def_module.$var)
-        if var.is_shared.x && var.is_mutable.x
+        if var.is_shared[] && var.is_mutable[]
             return :($(var.sym).contents)
         end
         return var.sym
@@ -134,16 +134,37 @@ function top_level_closure_conv(def_module::Module, ex)
     closure_conv(ex)
 end
 
+function destruct_rt_fn(::RuntimeFn{Args, Kwargs, Body})  where {Args, Kwargs, Body}
+    (Args, Kwargs, Body)
+end
+
+function destruct_rt_fn(expr::Expr)
+    @when :($lhs = $rhs) = expr begin
+        destruct_rt_fn(rhs)
+    @otherwise
+        error("Malformed input $expr")
+    end
+end
+
 function gg(mod::Module, source::Union{Nothing, LineNumberNode}, ex)
     @when Expr(hd, func_sig, body) = ex begin
         # a fake function to get all arguments of the generated function
         quote_hd = QuoteNode(hd)
         quote_sig = QuoteNode(deepcopy(func_sig))
         body = quote
-            let ast = $body,
-                fake_ast = $Expr($quote_hd, $quote_sig, ast), # to support generator's arguments as closures
-                fn :: $ScopedFunc = $solve(fake_ast)
-                generated  = $top_level_closure_conv($mod, fn.func.args[2])
+            let ast = $macroexpand($mod, $body),
+# get all arguments of the generated functions
+                fake_ast_for_args = $Expr($quote_hd, $quote_sig, $Expr(:block)),
+                fn_for_args :: $ScopedFunc = $solve(fake_ast_for_args),
+                args = [keys(fn_for_args.scope.bounds)...],
+# generate a fake function and extract out its function body
+                fake_ast_for_fn_body = $Expr($quote_hd, Expr(:tuple, args...), ast), # to support generator's arguments as closures
+                fn_for_fn_body :: $ScopedFunc = $solve(fake_ast_for_fn_body),
+                fn = $top_level_closure_conv($mod, fn_for_fn_body),
+                (_, _, Body) = $destruct_rt_fn(fn)
+# return the real function body
+                ex = from_type(Body)
+                ex
             end
         end
         generator = Expr(hd, func_sig, body)
@@ -154,5 +175,6 @@ function gg(mod::Module, source::Union{Nothing, LineNumberNode}, ex)
 end
 
 macro gg(ex)
-    gg(__module__, __source__, ex) |> esc
+    ex = gg(__module__, __source__, ex)
+    esc(ex)
 end
